@@ -1,0 +1,10 @@
+streamlit
+openai
+requests
+python-dotenv
+twilio
+fastapi
+starlette
+uvicorn
+pyngrok
+psutil
