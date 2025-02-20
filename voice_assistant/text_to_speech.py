@@ -1,112 +1,85 @@
-# voice_assistant/text_to_speech.py
-import logging
+import asyncio
+import websockets
 import json
-import pyaudio
-import elevenlabs
-import soundfile as sf
+import logging
+import os
+import uuid
+from dotenv import load_dotenv
 
-from openai import OpenAI
-from deepgram import DeepgramClient, SpeakOptions
-from elevenlabs.client import ElevenLabs
-from cartesia import Cartesia
+# Load environment variables from the .env file
+load_dotenv()
 
-from voice_assistant.local_tts_generation import generate_audio_file_melotts
+# Cartesia TTS WebSocket URL
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
+CARTESIA_TTS_WEBSOCKET_URL = (
+    f"wss://api.cartesia.ai/tts/websocket?api_key={CARTESIA_API_KEY}"
+    "&cartesia_version=2024-06-10"
+)
 
-def text_to_speech(model: str, api_key:str, text:str, output_file_path:str, local_model_path:str=None):
+async def text_to_speech(text: str, twilio_websocket, streamSid: str):
     """
-    Convert text to speech using the specified model.
-    
-    Args:
-    model (str): The model to use for TTS ('openai', 'deepgram', 'elevenlabs', 'local').
-    api_key (str): The API key for the TTS service.
-    text (str): The text to convert to speech.
-    output_file_path (str): The path to save the generated speech audio file.
-    local_model_path (str): The path to the local model (if applicable).
+    Convert text to speech using Cartesia TTS WebSocket and stream the audio to Twilio WebSocket.
+    This version mimics the JS flow by forwarding the received payload as-is.
     """
-    
-    try:
-        if model == 'openai':
-            client = OpenAI(api_key=api_key)
-            speech_response = client.audio.speech.create(
-                model="tts-1",
-                voice="nova",
-                input=text
-            )
+    logging.info("🔗 Connecting to Cartesia TTS WebSocket...")
+    async with websockets.connect(CARTESIA_TTS_WEBSOCKET_URL) as tts_ws:
+        logging.info("✅ Connected to Cartesia TTS WebSocket.")
 
-            speech_response.stream_to_file(output_file_path)
-            # with open(output_file_path, "wb") as audio_file:
-            #     audio_file.write(speech_response['data'])  # Ensure this correctly accesses the binary content
-
-        elif model == 'deepgram':
-            client = DeepgramClient(api_key=api_key)
-            options = SpeakOptions(
-                model="aura-arcas-en", #"aura-luna-en", # https://developers.deepgram.com/docs/tts-models
-                encoding="linear16",
-                container="wav"
-            )
-            SPEAK_OPTIONS = {"text": text}
-            response = client.speak.v("1").save(output_file_path, SPEAK_OPTIONS, options)
-        
-        elif model == 'elevenlabs':
-            client = ElevenLabs(api_key=api_key)
-            audio = client.generate(
-                text=text, 
-                voice="Paul J.", 
-                output_format="mp3_22050_32", 
-                model="eleven_turbo_v2"
-            )
-            elevenlabs.save(audio, output_file_path)
-        
-        elif model == "cartesia":
-            client = Cartesia(api_key=api_key)
-            voice_id = "156fb8d2-335b-4950-9cb3-a2d33befec77" #Helpful Woman"
-            voice = client.voices.get(id=voice_id)
-
-            # You can check out our models at https://docs.cartesia.ai/getting-started/available-models
-            model_id = "sonic-english"
-
-            # You can find the supported `output_format`s at https://docs.cartesia.ai/api-reference/endpoints/stream-speech-server-sent-events
-            output_format = {
+        context_id = f"context_{uuid.uuid4().hex}"
+        tts_request = {
+            "model_id": "sonic",
+            "transcript": text,
+            "voice": {
+                "mode": "id",
+                "id": "156fb8d2-335b-4950-9cb3-a2d33befec77"
+            },
+            "context_id": context_id,
+            "output_format": {
                 "container": "raw",
-                "encoding": "pcm_f32le",
-                "sample_rate": 44100,
+                "encoding": "pcm_mulaw",
+                "sample_rate": 8000
             }
+        }
 
-            p = pyaudio.PyAudio()
-            rate = 44100
+        await tts_ws.send(json.dumps(tts_request))
+        logging.info(f"🗣️ Sent text to TTS WebSocket: {text}")
 
-            stream = None
+        async for message in tts_ws:
+            if isinstance(message, str):
+                try:
+                    data = json.loads(message)
+                except Exception as e:
+                    logging.error(f"Error parsing TTS message: {e}")
+                    continue
 
-            # Generate and stream audio
-            for output in client.tts.sse(
-                model_id=model_id,
-                transcript=text,
-                voice_embedding=voice["embedding"],
-                stream=True,
-                output_format=output_format,
-            ):
-                buffer = output["audio"]
+                # logging.info(f"📜 Received metadata from Cartesia: {data}")
 
-                if stream is None:
-                    stream = p.open(format=pyaudio.paFloat32, channels=1, rate=rate, output=True)
+                if "error" in data:
+                    logging.error(f"❌ Cartesia API Error: {data['error']}")
+                    break
 
-                # Write the audio data to the stream
-                stream.write(buffer)
-            
-            if stream:
-                stream.stop_stream()
-                stream.close()
-            p.terminate()
+                if data.get("done", False):
+                    logging.info("✅ TTS generation complete.")
+                    break
 
-        elif model == "melotts": # this is a local model
-            generate_audio_file_melotts(text=text, filename=output_file_path)
-        
-        elif model == 'local':
-            with open(output_file_path, "wb") as f:
-                f.write(b"Local TTS audio data")
-        
-        else:
-            raise ValueError("Unsupported TTS model")
-        
-    except Exception as e:
-        logging.error(f"Failed to convert text to speech: {e}")
+                if "data" in data:
+                    payload = data["data"]  # Expecting a Base64 string
+                    if not streamSid:
+                        logging.error("❌ streamSid is missing. Cannot send audio to Twilio.")
+                        continue
+
+                    try:
+                        # Use send_text (FastAPI WebSocket method) instead of send()
+                        await twilio_websocket.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": streamSid,
+                            "media": {
+                                "payload": payload
+                            }
+                        }))
+                        # logging.info("🎵 Forwarded audio chunk to Twilio.")
+                    except Exception as e:
+                        logging.error(f"❌ Failed to forward audio chunk: {e}")
+            else:
+                logging.warning("⚠️ Received non-text message from TTS WebSocket.")
+        logging.info("🔚 TTS streaming completed.")
