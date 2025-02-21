@@ -65,7 +65,7 @@ async def text_to_speech(text: str, twilio_websocket, streamSid: str):
                 if "data" in data:
                     payload = data["data"]  # Expecting a Base64 string
                     if not streamSid:
-                        logging.error("❌ streamSid is missing. Cannot send audio to Twilio.")
+                        # logging.error("❌ streamSid is missing. Cannot send audio to Twilio.")
                         continue
 
                     try:
